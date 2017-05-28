@@ -106,6 +106,7 @@ function lcm.dissector(tvbuf,pinfo,root)
   xeth.dissector(tvbuf(2,datalen):tvb(), pinfo, root)
 end
 DissectorTable.get("udp.port"):add(42424, lcm)
+DissectorTable.get("udp.port"):add(42425, lcm)
 
 -- Dissector for PUP packets
 -- First, the differnet types of PUP packets
@@ -170,6 +171,36 @@ local puptypes = {
   [132]= "Gateway Information Statistics Reply",  -- 0204
 }
 
+-- Well-known PUP sockets from http://xeroxalto.computerhistory.org/_cd8_/pup/.netconstants.bravo!4.html
+local pup_sockets = {
+  [1] = "Telnet",
+  [2] = "GateWay-Info",
+  [3] = "FTP",
+  [4] = "Misc-Services",
+  [5] = "Echo",
+  [6] = "BSP-Test",
+  [7] = "Mail",
+  [16] = "EFTP-Receive",
+  [17] = "Ears-Status",
+  [18] = "Statistics",
+  [21] = "CopyDisk",
+  [24] = "eventReport",
+  [25] = "printerReport",
+  [28] = "Juniper Pack Conversion",
+  [29] = "Juniper Event",
+  [30] = "RPCP",
+  [31] = "Clearinghouse",
+  [33] = "Librarian",
+  [34] = "WIFS",
+  [35] = "Leaf",
+  [48] = "TeleSwat",
+  [61] = "LookupFile",
+  [64] = "Juniper-Pine",
+  [272] = "WFS",
+}
+
+local port_conn_map = {} -- table mapping port to connection type
+
 local pup = Proto("pup", "PUP Protocol")
 
 local pup_length = ProtoField.uint16 ("pup.length", "Length")
@@ -187,21 +218,48 @@ function pup.dissector(tvbuf,pinfo,root)
   tree:add(pup_id, tvbuf:range(4,4))
   local dest_port = tree:add(tvbuf(8,6),"Dest port: ")
   port.dissector(tvbuf(8,6):tvb(), pinfo, dest_port)
-  dest_port:append_text(string.format("%o#%o#%o#", tvbuf:range(8,1):uint(), tvbuf:range(9,1):uint(), tvbuf:range(10,4):uint()))
+  local dest_port_str = string.format("%o#%o#%o#", tvbuf:range(8,1):uint(), tvbuf:range(9,1):uint(), tvbuf:range(10,4):uint())
+  dest_port:append_text(dest_port_str)
   local src_port = tree:add(tvbuf(14,6),"Src port: ")
   port.dissector(tvbuf(14,6):tvb(), pinfo, src_port)
-  src_port:append_text(string.format("%o#%o#%o#", tvbuf:range(14,1):uint(), tvbuf:range(15,1):uint(), tvbuf:range(16,4):uint()))
+  local src_port_str = string.format("%o#%o#%o#", tvbuf:range(14,1):uint(), tvbuf:range(15,1):uint(), tvbuf:range(16,4):uint())
+  src_port:append_text(src_port_str)
+  local port_str = src_port_str .. " -> " .. dest_port_str;
+  pinfo.cols.info:set(port_str)
+
+  -- Do we know what service the socket connection was to?
+  local service = ""
+  local src_port = bit.lshift(tvbuf(14,2):uint(), 32) + tvbuf(16,4):uint()
+  if port_conn_map[src_port] ~= nil then
+    service = port_conn_map[src_port] .. ": "
+  end
+  local dst_port = bit.lshift(tvbuf(8,2):uint(), 32) + tvbuf(10,4):uint()
+  if port_conn_map[dst_port] ~= nil then
+    service = port_conn_map[dst_port] .. ": "
+  end
 
   local type = tvbuf(3,1):uint()
   if puptypes[type] ~= nil then
-    pinfo.cols.protocol:set(puptypes[type])
+    pinfo.cols.protocol:set(service .. puptypes[type])
   else
-    pinfo.cols.protocol:set("PUP")
+    pinfo.cols.protocol:set(service .. "PUP")
   end
   local datalen = tvbuf(0,2):uint() - 22
   local datalen2 = datalen + (datalen % 2) -- round up to word
   tree:add(pup_checksum, tvbuf:range(20+datalen2,2))
   DissectorTable.get("pup"):try(type, tvbuf(20,datalen):tvb(), pinfo, root)
+
+  -- If an RFC packet, keep track of what socket the original connection went to
+  if type == 8 then
+    local src_socket = tvbuf(16,4):uint()
+    if pup_sockets[src_socket] ~= nil then
+      -- Tricky to convert 6-byte port to integer
+      local dst_port = bit.lshift(tvbuf(8,2):uint(), 32) + tvbuf(10,4):uint()
+      local conn_port = bit.lshift(tvbuf(20,2):uint(), 32) + tvbuf(22,4):uint()
+      port_conn_map[dst_port] = pup_sockets[src_socket]
+      port_conn_map[conn_port] = pup_sockets[src_socket]
+    end
+  end
 end
 
 -- PUP packets have Ethernet type 0x200
@@ -230,6 +288,17 @@ function abort.dissector(tvbuf,pinfo,root)
   pinfo.cols.info:set(tvbuf(2):string())
 end
 DissectorTable.get("pup"):add(9, abort)
+
+-- Dissector for PUP RFC packet
+local rfc = Proto("rfc", "RFC")
+function rfc.dissector(tvbuf,pinfo,root)
+  local tree = root:add(abort, tvbuf:range(0,pktlen))
+  local conn_port = tree:add(tvbuf(0,6),"Connection port: ")
+  port.dissector(tvbuf(0,6):tvb(), pinfo, conn_port)
+  local conn_port_str = string.format("%o#%o#%o#", tvbuf:range(0,1):uint(), tvbuf:range(1,1):uint(), tvbuf:range(2,4):uint())
+  pinfo.cols.protocol:set("RFC: " .. conn_port_str)
+end
+DissectorTable.get("pup"):add(8, rfc)
 
 -- Dissector for PUP Gateway Info Reply packet
 -- http://xeroxalto.computerhistory.org/_cd8_/pup/.gatewayinformation.bravo!1.html
